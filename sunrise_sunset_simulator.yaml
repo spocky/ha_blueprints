@@ -1,0 +1,304 @@
+blueprint:
+  name: Sunrise and Sunset Simulator
+  description: >
+    Simulate a sunrise or sunset by gradually adjusting brightness and changing colors.
+  source_url: https://github.com/spocky/ha_blueprints/blob/main/sunrise_sunset_simulator.yaml  
+  domain: automation
+  author: Spocky (on the shoulders of Sbyx & Chreece)
+  homeassistant:
+    min_version: "2024.6.0"
+  input:
+    target_light:
+      name: Wake-up light entity
+      description: The light to control. Turning it off during the simulation will keep it off.
+      selector:
+        entity:
+          domain: light
+    alarm_time:
+      name: Alarm timestamp sensor
+      description: >
+        The timestamp at which the simulation should end (e.g., the next alarm from your smartphone).
+      selector:
+        entity:
+          device_class: timestamp
+    duration:
+      name: Simulation duration
+      description: The simulation will start the configured number of minutes before the timestamp.
+      default: 25
+      selector:
+        number:
+          min: 1
+          max: 60
+    brightness_section:
+      name: Brightness
+      icon: mdi:brightness-5
+      description: These options control the brightness. Depending on their respective values, they will trigger a sunrise or a sunset.
+      collapsed: true
+      input:
+        start_brightness:
+          name: Starting brightness
+          description: The brightness to start with.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 100
+        end_brightness:
+          name: Ending brightness
+          description: The brightness to transition to.
+          default: 100
+          selector:
+            number:
+              min: 0
+              max: 100
+    color_section:
+      name: RGB Color
+      icon: mdi:palette
+      description: These options control the RGB Color
+      collapsed: true
+      input:
+        start_rgb_color:
+          name: Starting RGB Color
+          description: The starting RGB color
+          default: [255, 0, 0]
+          selector:
+            color_rgb:
+        end_rgb_color:
+          name: Ending RGB Color
+          description: The ending RGB color
+          default: [255, 167, 0]
+          selector:
+            color_rgb:
+    mired_section:
+      name: Color temperature
+      icon: mdi:thermometer
+      description: These options control the color temperature
+      collapsed: true
+      input:
+        start_mired:
+          name: Starting color temperature
+          description: The starting color temperature (0 = lowest supported)
+          default: 0
+          selector:
+            color_temp:
+        end_mired:
+          name: Ending color temperature
+          description: The ending color temperature (0 = highest supported)
+          default: 0
+          selector:
+            color_temp:
+    advanced_section:
+      name: Advanced settings
+      icon: mdi:cogs
+      description: Additional checks and actions
+      collapsed: true
+      input:
+        additional_entity:
+          name: Additional entity to check before simulation is triggered
+          description: >
+            If set, checks if entity is 'on' or 'home' before triggering. Use e.g. a (workday) sensor, device_tracker or person entity.
+          default: none
+          selector:
+            entity: {}
+        pre_simulation_actions:
+          name: Pre-simulation actions
+          description: Optional actions to run before simulation starts.
+          default: []
+          selector:
+            action: {}
+        post_simulation_actions:
+          name: Post-simulation actions
+          description: Optional actions to run after simulation ends.
+          default: []
+          selector:
+            action: {}
+trigger:
+  - platform: template
+    value_template: >
+      {% set alarm = states('sensor.alarm_time') | as_datetime %}
+      {% set start_time = (alarm - timedelta(minutes=dur)).strftime('%Y-%m-%d %H:%M:%S') %}
+      {{ now().strftime('%Y-%m-%d %H:%M:%S') == start_time }}
+
+variables:
+  dur: !input duration
+  start_bri: !input start_brightness
+  end_bri: !input end_brightness
+  target_light: !input target_light
+  start_color: !input start_rgb_color
+  end_color: !input end_rgb_color
+  start_mired: !input start_mired
+  end_mired: !input end_mired
+  additional_entity: !input additional_entity
+
+action:
+  - condition: template
+    value_template: >
+      {% if additional_entity %}
+        {% set state = states(additional_entity).state %}
+        {{ state in ['on', 'home'] }}
+      {% else %}
+        true
+      {% endif %}
+  - choose:
+      - conditions: "{{ additional_entity is defined }}"
+        sequence:
+          - choose:
+              - conditions: "{{ is_state(additional_entity, 'on') or is_state(additional_entity, 'home') }}"
+                sequence: !input pre_simulation_actions
+  - parallel:
+      - if:
+          - condition: template
+            value_template: "{{ integration_entities('wled') | count > 0 }}"
+        then:
+          - repeat:
+              for_each: "{{ integration_entities('wled') }}"
+              sequence:
+                - service: light.turn_on
+                  data:
+                    effect: Sunrise
+                  target:
+                    entity_id: "{{ repeat.item }}"
+                - service: number.set_value
+                  data:
+                    value: "{{ [(255 * (end_bri/100)) | int, 255] | min }}"
+                  target:
+                    entity_id: >
+                      {{ device_entities(device_id(repeat.item)) 
+                         | select('search', 'number.') 
+                         | select('search', 'intensity') 
+                         | list | first }}
+                - service: number.set_value
+                  data:
+                    value: "{{ [dur, 128] | min }}"
+                  target:
+                    entity_id: >
+                      {{ device_entities(device_id(repeat.item)) 
+                         | select('search', 'number.') 
+                         | select('search', 'speed') 
+                         | list | first }}
+      - if:
+          - condition: template
+            value_template: "{{ expand(target_light) | selectattr('attributes.supported_color_modes', 'defined') | selectattr('attributes.supported_color_modes', 'eq', 'brightness') | list | count > 0 }}"
+        then:
+          - repeat:
+              while:
+                - condition: template
+                  value_template: "{{ repeat.index <= 100 and not (repeat.index > 1 and states.light | selectattr('entity_id', 'in', expand(target_light) | selectattr('attributes.supported_color_modes', 'eq', 'brightness') | map(attribute='entity_id') | list) | selectattr('state', 'eq', 'on') | list | count == 0) }}"
+              sequence:
+                - variables:
+                    bright: >
+                      {% if repeat.index > 1 %}
+                        {{ expand(target_light) 
+                           | selectattr('attributes.supported_color_modes', 'eq', 'brightness') 
+                           | selectattr('state', 'eq', 'on') 
+                           | map(attribute='entity_id') 
+                           | list }}
+                      {% else %}
+                        {{ expand(target_light) 
+                           | selectattr('attributes.supported_color_modes', 'eq', 'brightness') 
+                           | map(attribute='entity_id') 
+                           | list }}
+                      {% endif %}
+                - service: light.turn_on
+                  data:
+                    transition: "{{ ((dur * 60) / 100) | int }}"
+                    brightness_pct: "{{ [(start_bri + (repeat.index * (end_bri - start_bri) / 100)) | int, end_bri] | min }}"
+                  target:
+                    entity_id: "{{ bright }}"
+                - delay:
+                    milliseconds: "{{ ((dur * 60) / 100) * 1000 | int }}"
+      - if:
+          - condition: template
+            value_template: "{{ expand(target_light) | selectattr('attributes.supported_color_modes', 'defined') | selectattr('attributes.supported_color_modes', 'eq', 'color_temp') | list | count > 0 }}"
+        then:
+          - repeat:
+              while:
+                - condition: template
+                  value_template: "{{ repeat.index <= 100 and not (repeat.index > 1 and states.light | selectattr('entity_id', 'in', expand(target_light) | selectattr('attributes.supported_color_modes', 'eq', 'color_temp') | map(attribute='entity_id') | list) | selectattr('state', 'eq', 'on') | list | count == 0) }}"
+              sequence:
+                - variables:
+                    step: "{{ repeat.index }}"
+                    temp: >
+                      {% if repeat.index > 1 %}
+                        {{ expand(target_light) 
+                           | selectattr('attributes.supported_color_modes', 'eq', 'color_temp') 
+                           | selectattr('state', 'eq', 'on') 
+                           | map(attribute='entity_id') 
+                           | list }}
+                      {% else %}
+                        {{ expand(target_light) 
+                           | selectattr('attributes.supported_color_modes', 'eq', 'color_temp') 
+                           | map(attribute='entity_id') 
+                           | list }}
+                      {% endif %}
+                - repeat:
+                    for_each: "{{ temp }}"
+                    sequence:
+                      - service: light.turn_on
+                        data:
+                          transition: "{{ ((dur * 60) / 100) | int }}"
+                          brightness_pct: "{{ [(start_bri + (step * (end_bri - start_bri) / 100)) | int, end_bri] | min }}"
+                        target:
+                          entity_id: "{{ repeat.item }}"
+                      - service: light.turn_on
+                        data:
+                          color_temp: >
+                            {% set max_mireds = state_attr(repeat.item, 'max_mireds') %}
+                            {% set min_mireds = state_attr(repeat.item, 'min_mireds') %}
+                            {% set dec = (max_mireds - min_mireds) / 100 %}
+                            {% if start_mired != 0 or end_mired != 0 %}
+                              {{ (start_mired + (step * (end_mired - start_mired) / 100)) | int }}
+                            {% else %}
+                              {{ (max_mireds - (dec * (step - 1))) | int if step < 100 else min_mireds }}
+                            {% endif %}
+                        target:
+                          entity_id: "{{ repeat.item }}"
+                - delay:
+                    milliseconds: "{{ ((dur * 60) / 100) * 1000 | int }}"
+      - if:
+          - condition: template
+            value_template: "{{ expand(target_light) | rejectattr('attributes.supported_color_modes', 'eq', 'color_temp') | rejectattr('attributes.supported_color_modes', 'eq', 'brightness') | list | count > 0 }}"
+        then:
+          - repeat:
+              while:
+                - condition: template
+                  value_template: "{{ repeat.index <= 100 }}"
+              sequence:
+                - variables:
+                    color: >
+                      {% if repeat.index > 1 %}
+                        {{ expand(target_light) 
+                           | rejectattr('attributes.supported_color_modes', 'eq', 'color_temp') 
+                           | rejectattr('attributes.supported_color_modes', 'eq', 'brightness') 
+                           | selectattr('state', 'eq', 'on') 
+                           | map(attribute='entity_id') 
+                           | list }}
+                      {% else %}
+                        {{ expand(target_light) 
+                           | rejectattr('attributes.supported_color_modes', 'eq', 'color_temp') 
+                           | rejectattr('attributes.supported_color_modes', 'eq', 'brightness') 
+                           | map(attribute='entity_id') 
+                           | list }}
+                      {% endif %}
+                - service: light.turn_on
+                  data:
+                    rgb_color: >
+                      [
+                        {{ (start_color[0] + (repeat.index * (end_color[0] - start_color[0]) / 100)) | int }},
+                        {{ (start_color[1] + (repeat.index * (end_color[1] - start_color[1]) / 100)) | int }},
+                        {{ (start_color[2] + (repeat.index * (end_color[2] - start_color[2]) / 100)) | int }}
+                      ]
+                  target:
+                    entity_id: "{{ color }}"
+                - service: light.turn_on
+                  data:
+                    transition: "{{ ((dur * 60) / 100) | int }}"
+                    brightness_pct: "{{ [(start_bri + (repeat.index * (end_bri - start_bri) / 100)) | int, end_bri] | min }}"
+                  target:
+                    entity_id: "{{ color }}"
+                - delay:
+                    milliseconds: "{{ ((dur * 60) / 100) * 1000 | int }}"
+  - choose:
+      - conditions: "{{ post_simulation_actions is defined }}"
+        sequence: !input post_simulation_actions
+mode: single
